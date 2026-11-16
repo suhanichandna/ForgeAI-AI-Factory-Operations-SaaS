@@ -1,0 +1,383 @@
+// ForgeAI — AI Factory Operations SaaS
+// Schema follows §10 "Database Design" of the Technical Blueprint.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // Only needed when DATABASE_URL is a pooled connection (Neon, Supabase,
+  // PgBouncer, etc.) — migrations need a direct connection. Point it at the
+  // same value as DATABASE_URL for local/unpooled Postgres (see .env.example).
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------- tenancy
+
+enum Role {
+  FACTORY_ADMIN
+  PRODUCTION_MANAGER
+  INVENTORY_MANAGER
+  PROCUREMENT_MANAGER
+  MANAGEMENT
+  EMPLOYEE
+}
+
+model Company {
+  id        String    @id @default(cuid())
+  name      String
+  createdAt DateTime  @default(now())
+  factories Factory[]
+  users     User[]
+}
+
+model Factory {
+  id         String      @id @default(cuid())
+  companyId  String
+  company    Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name       String
+  location   String
+  warehouses Warehouse[]
+  machines   Machine[]
+
+  @@index([companyId])
+}
+
+model User {
+  id           String   @id @default(cuid())
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         Role
+  createdAt    DateTime @default(now())
+
+  approvals Approval[]
+  auditLogs AuditLog[]
+
+  @@index([companyId])
+}
+
+// ------------------------------------------------------------ master data
+
+model Warehouse {
+  id        String      @id @default(cuid())
+  factoryId String
+  factory   Factory     @relation(fields: [factoryId], references: [id], onDelete: Cascade)
+  name      String
+  code      String
+  inventory Inventory[]
+
+  @@index([factoryId])
+}
+
+model Product {
+  id        String    @id @default(cuid())
+  sku       String    @unique
+  name      String
+  unit      String    @default("pcs")
+  unitPrice Float     @default(0)
+
+  bom              ProductMaterial[]
+  productionOrders ProductionOrder[]
+  salesOrderLines  SalesOrderLine[]
+  inventory        Inventory[]
+  forecasts        Forecast[]
+
+  @@index([name])
+}
+
+model RawMaterial {
+  id           String @id @default(cuid())
+  code         String @unique
+  name         String
+  unit         String @default("kg")
+  safetyStock  Float  @default(0)
+  standardCost Float  @default(0)
+
+  bomLines        ProductMaterial[]
+  inventory       Inventory[]
+  suppliers       SupplierMaterial[]
+  poLines         PurchaseOrderLine[]
+  transactions    InventoryTransaction[]
+  recommendations Recommendation[]
+
+  @@index([name])
+}
+
+/// One line of a Bill of Materials: how much of a raw material one unit of a product needs.
+model ProductMaterial {
+  id              String      @id @default(cuid())
+  productId       String
+  product         Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  rawMaterialId   String
+  rawMaterial     RawMaterial @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
+  quantityPerUnit Float
+
+  @@unique([productId, rawMaterialId])
+}
+
+// --------------------------------------------------------------- inventory
+
+model Inventory {
+  id            String       @id @default(cuid())
+  warehouseId   String
+  warehouse     Warehouse    @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  rawMaterialId String?
+  rawMaterial   RawMaterial? @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
+  productId     String?
+  product       Product?     @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  quantityOnHand   Float @default(0)
+  quantityReserved Float @default(0)
+
+  @@unique([warehouseId, rawMaterialId])
+  @@unique([warehouseId, productId])
+}
+
+enum TransactionType {
+  RECEIPT
+  ISSUE
+  RESERVATION
+  RELEASE
+  ADJUSTMENT
+}
+
+/// Append-only stock ledger. Every quantity change in the system lands here.
+model InventoryTransaction {
+  id            String          @id @default(cuid())
+  rawMaterialId String
+  rawMaterial   RawMaterial     @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
+  warehouseId   String
+  type          TransactionType
+  quantity      Float
+  reference     String?
+  note          String?
+  createdAt     DateTime        @default(now())
+
+  @@index([rawMaterialId, createdAt])
+}
+
+// -------------------------------------------------------------- production
+
+enum ProductionStatus {
+  PLANNED
+  RELEASED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model ProductionOrder {
+  id          String           @id @default(cuid())
+  orderNumber String           @unique
+  productId   String
+  product     Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity    Float
+  status      ProductionStatus @default(PLANNED)
+  dueDate     DateTime
+  createdAt   DateTime         @default(now())
+
+  @@index([status])
+}
+
+// ------------------------------------------------------------- procurement
+
+model Supplier {
+  id   String @id @default(cuid())
+  code String @unique
+  name String
+  /// 0..1 - share of past purchase orders delivered on time.
+  reliability  Float @default(0.9)
+  /// 0..1 - share of past deliveries passing quality control.
+  qualityScore Float @default(0.9)
+
+  materials       SupplierMaterial[]
+  purchaseOrders  PurchaseOrder[]
+  recommendations Recommendation[]
+}
+
+model SupplierMaterial {
+  id            String      @id @default(cuid())
+  supplierId    String
+  supplier      Supplier    @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  rawMaterialId String
+  rawMaterial   RawMaterial @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
+  unitPrice     Float
+  leadTimeDays  Int
+  minOrderQty   Float       @default(0)
+
+  @@unique([supplierId, rawMaterialId])
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  ORDERED
+  RECEIVED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id           String              @id @default(cuid())
+  poNumber     String              @unique
+  supplierId   String
+  supplier     Supplier            @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  status       PurchaseOrderStatus @default(DRAFT)
+  totalCost    Float               @default(0)
+  expectedDate DateTime
+  createdAt    DateTime            @default(now())
+  receivedAt   DateTime?
+  lines        PurchaseOrderLine[]
+
+  @@index([status])
+}
+
+model PurchaseOrderLine {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  rawMaterialId   String
+  rawMaterial     RawMaterial   @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
+  quantity        Float
+  unitPrice       Float
+}
+
+// ----------------------------------------------------------- sales / demand
+
+model Customer {
+  id     String       @id @default(cuid())
+  name   String
+  orders SalesOrder[]
+}
+
+model SalesOrder {
+  id         String           @id @default(cuid())
+  customerId String
+  customer   Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  orderDate  DateTime
+  lines      SalesOrderLine[]
+
+  @@index([orderDate])
+}
+
+model SalesOrderLine {
+  id           String     @id @default(cuid())
+  salesOrderId String
+  salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  productId    String
+  product      Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity     Float
+
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------- machines
+
+model Machine {
+  id        String              @id @default(cuid())
+  factoryId String
+  factory   Factory             @relation(fields: [factoryId], references: [id], onDelete: Cascade)
+  code      String              @unique
+  name      String
+  status    String              @default("RUNNING")
+  readings  MachineSensorData[]
+
+  @@index([factoryId])
+}
+
+model MachineSensorData {
+  id          String   @id @default(cuid())
+  machineId   String
+  machine     Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  recordedAt  DateTime
+  temperature Float
+  vibration   Float
+  pressure    Float
+  rpm         Float
+  powerDraw   Float
+  /// 0..1, higher means more anomalous. Computed at ingest.
+  anomalyScore Float   @default(0)
+
+  @@index([machineId, recordedAt])
+}
+
+// ------------------------------------------------------ AI layer & workflow
+
+/// A stored demand forecast point for one product on one day.
+model Forecast {
+  id           String   @id @default(cuid())
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  forecastDate DateTime
+  quantity     Float
+  model        String   @default("seasonal-naive")
+  generatedAt  DateTime @default(now())
+
+  @@unique([productId, forecastDate])
+  @@index([forecastDate])
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum RecommendationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// An explainable purchase recommendation from the risk + supplier engines.
+model Recommendation {
+  id            String      @id @default(cuid())
+  rawMaterialId String
+  rawMaterial   RawMaterial @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
+  supplierId    String
+  supplier      Supplier    @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  quantity      Float
+  estimatedCost Float
+  riskLevel     RiskLevel
+  stockoutDate  DateTime?
+  /// Human-readable justification rendered on the approval screen.
+  reason String
+  /// Full engine output (projection series, supplier scores) for the "why" drawer.
+  detail          Json?
+  status          RecommendationStatus @default(PENDING)
+  createdAt       DateTime             @default(now())
+  purchaseOrderId String?
+
+  approval Approval?
+
+  @@index([status])
+}
+
+model Approval {
+  id               String         @id @default(cuid())
+  recommendationId String         @unique
+  recommendation   Recommendation @relation(fields: [recommendationId], references: [id], onDelete: Cascade)
+  approvedById     String
+  approvedBy       User           @relation(fields: [approvedById], references: [id])
+  decision         String
+  comment          String?
+  decidedAt        DateTime       @default(now())
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String
+  entityType String
+  entityId   String?
+  summary    String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+}
